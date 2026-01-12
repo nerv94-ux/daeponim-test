@@ -2,3 +2,5 @@ streamlit
 requests
 bcrypt
 pandas
+openpyxl
+xlrd
