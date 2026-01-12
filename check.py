@@ -6,153 +6,149 @@ import base64
 import pandas as pd
 from datetime import datetime
 import calendar
+import io
 
-# 페이지 설정
-st.set_page_config(page_title="부가세 마스터 V3", layout="wide")
+st.set_page_config(page_title="부가세 마스터 V3 (수정본)", layout="wide")
 st.title("🚜 유기농부 부가세 통합 정산 시스템 (V3)")
 
-# --- [사이드바: 날짜를 숫자로 선택] ---
+# --- [사이드바: 날짜 및 API 설정] ---
 with st.sidebar:
     st.header("📅 조회 기간 설정")
-    # 달력 대신 숫자로 선택하게 변경
-    curr_year = datetime.now().year
-    target_year = st.selectbox("연도 선택", [curr_year, curr_year-1], index=0)
+    curr_year = 2026 # 현재 연도 기준
+    target_year = st.selectbox("연도 선택", [2025, 2026], index=0)
     
-    col_start, col_end = st.columns(2)
-    with col_start:
-        start_m = st.selectbox("시작 월", list(range(1, 13)), index=6) # 기본 7월
-    with col_end:
-        end_m = st.selectbox("종료 월", list(range(1, 13)), index=8)   # 기본 9월
+    col1, col2 = st.columns(2)
+    with col1: start_m = st.selectbox("시작 월", list(range(1, 13)), index=6) # 7월
+    with col2: end_m = st.selectbox("종료 월", list(range(1, 13)), index=8)   # 9월
     
-    # 내부적으로 사용할 datetime 변환
     last_day = calendar.monthrange(target_year, end_m)[1]
-    start_date = datetime(target_year, start_m, 1)
-    end_date = datetime(target_year, end_m, last_day)
-    
-    st.success(f"선택 기간: {target_year}년 {start_m}월 ~ {end_m}월")
+    start_dt = datetime(target_year, start_m, 1)
+    end_dt = datetime(target_year, end_m, last_day)
     
     st.divider()
     st.subheader("🔑 네이버 API 설정")
-    n_id = st.text_input("Client ID")
-    n_secret = st.text_input("Client Secret", type="password")
+    n_id = st.text_input("Client ID", key="n_id")
+    n_secret = st.text_input("Client Secret", type="password", key="n_secret")
     st.caption("허용 IP: 34.127.0.121")
 
-# --- [1. 네이버 API 실전 호출 함수] ---
-def get_naver_api_data(c_id, c_secret, s_date, e_date):
+# --- [엑셀/CSV 분석 엔진] ---
+def analyze_files(files):
+    results = []
+    for f in files:
+        fname = f.name
+        try:
+            # 파일 형식 및 헤더 스킵 처리
+            if "11번가" in fname or "계산서" in fname:
+                df = pd.read_csv(f, skiprows=5) if fname.endswith('.csv') else pd.read_excel(f, skiprows=5)
+            else:
+                df = pd.read_csv(f) if fname.endswith('.csv') else pd.read_excel(f)
+            
+            # 마켓별 로직
+            if "쿠팡" in fname:
+                # 과세/면세 구분 합산
+                card = df['신용카드(판매)'].sum() - df['신용카드(환불)'].sum()
+                cash = df['현금(판매)'].sum() - df['현금(환불)'].sum()
+                etc = df['기타(판매)'].sum() - df['기타(환불)'].sum()
+                # 과세유형이 TAX인 것과 FREE인 것을 분리할 수 있으나 통합 합계 우선
+                results.append({"마켓": f"쿠팡({fname[:10]})", "카드": card, "현금": cash, "기타": etc, "면세": 0})
+            
+            elif "11번가" in fname:
+                results.append({"마켓": "11번가", "카드": df['신용카드결제'].sum(), "현금": df['현금영수증(소득공제용)'].sum() + df['현금영수증(지출증빙용)'].sum(), "기타": df['기타결제금액'].sum(), "면세": df['면세매출금액'].sum()})
+                
+            elif "롯데ON" in fname:
+                results.append({"마켓": "롯데온", "카드": df['신용카드'].sum(), "현금": df['현금영수증'].sum(), "기타": df['휴대폰'].sum() + df['기타'].sum(), "면세": 0})
+                
+            elif "토스" in fname:
+                # 토스 건별 정산 자료 분석
+                card = df[df['결제수단'].str.contains('카드', na=False, case=False)]['결제수단 결제 금액'].sum()
+                cash = df[df['결제수단'].str.contains('토스머니|계좌|현금', na=False, case=False)]['결제수단 결제 금액'].sum()
+                etc = df['결제수단 결제 금액'].sum() - (card + cash)
+                results.append({"마켓": f"토스({fname[:7]})", "카드": card, "현금": cash, "기타": etc, "면세": 0})
+
+            elif "매출전자세금계산서" in fname:
+                results.append({"마켓": "세금계산서발행", "카드": 0, "현금": 0, "기타": 0, "면세": 0, "증빙": df['합계금액'].sum()})
+
+            elif "매출전자계산서" in fname:
+                results.append({"마켓": "면세계산서발행", "카드": 0, "현금": 0, "기타": 0, "면세": df['합계금액'].sum(), "증빙": 0})
+
+        except Exception as e:
+            st.error(f"{fname} 파일 해석 실패: {e}")
+    return results
+
+# --- [네이버 API 엔진] ---
+def fetch_naver_data(cid, secret, s_dt, e_dt):
     try:
-        # 토큰 발급 (보안 인증)
-        timestamp = str(int(time.time() * 1000))
-        password = (c_id + "_" + timestamp).encode('utf-8')
-        hashed = bcrypt.hashpw(password, c_secret.encode('utf-8'))
-        client_secret_sign = base64.b64encode(hashed).decode('utf-8')
+        ts = str(int(time.time() * 1000))
+        pwd = (cid + "_" + ts).encode('utf-8')
+        hashed = bcrypt.hashpw(pwd, secret.encode('utf-8'))
+        sign = base64.b64encode(hashed).decode('utf-8')
 
-        token_url = "https://api.commerce.naver.com/external/v1/oauth2/token"
-        token_res = requests.post(token_url, data={
-            "client_id": c_id, "timestamp": timestamp,
-            "grant_type": "client_credentials", "client_secret_sign": client_secret_sign, "type": "SELF"
-        })
-        token = token_res.json().get('access_token')
-        if not token: return None
+        # 1. 토큰 요청
+        res = requests.post("https://api.commerce.naver.com/external/v1/oauth2/token", 
+                            data={"client_id": cid, "timestamp": ts, "grant_type": "client_credentials", "client_secret_sign": sign, "type": "SELF"})
+        token = res.json().get('access_token')
+        if not token: return f"인증 실패: {res.text}"
 
-        # 정산 내역 API 호출
-        report_url = "https://api.commerce.naver.com/external/v1/settle/tax-report"
+        # 2. 정산 데이터 요청
         headers = {"Authorization": f"Bearer {token}"}
-        params = {"searchStartDate": s_date.strftime("%Y-%m-%d"), "searchEndDate": e_date.strftime("%Y-%m-%d")}
+        params = {"searchStartDate": s_dt.strftime("%Y-%m-%d"), "searchEndDate": e_dt.strftime("%Y-%m-%d")}
+        data_res = requests.get("https://api.commerce.naver.com/external/v1/settle/tax-report", headers=headers, params=params)
         
-        res = requests.get(report_url, headers=headers, params=params)
-        if res.status_code == 200:
-            data = res.json()
-            # 네이버 실제 응답에서 각 항목별 합산
-            results = {"카드": 0, "현금": 0, "기타": 0, "면세": 0}
-            for item in data:
-                results["카드"] += item.get('cardSalesAmount', 0)
-                results["현금"] += item.get('cashReceiptSalesAmount', 0)
-                results["기타"] += item.get('etcSalesAmount', 0)
-                results["면세"] += item.get('taxFreeSalesAmount', 0)
-            return results
-    except:
-        return None
-    return None
-
-# --- [2. 엑셀 분석 엔진 (대표님 파일 맞춤형)] ---
-def parse_excel_file(file):
-    fname = file.name
-    try:
-        # 11번가 & (세금)계산서: 5줄 스킵 필요
-        if "11번가" in fname or "계산서" in fname:
-            df = pd.read_csv(file, skiprows=5) if fname.endswith('.csv') else pd.read_excel(file, skiprows=5)
-        else:
-            df = pd.read_csv(file) if fname.endswith('.csv') else pd.read_excel(file)
-
-        if "쿠팡" in fname:
-            # 판매액 - 환불액 합산
-            card = df['신용카드(판매)'].sum() - df['신용카드(환불)'].sum()
-            cash = df['현금(판매)'].sum() - df['현금(환불)'].sum()
-            etc = df['기타(판매)'].sum() - df['기타(환불)'].sum()
-            return {"마켓": "쿠팡", "카드": card, "현금": cash, "기타": etc, "면세": 0}
-        
-        elif "11번가" in fname:
-            return {"마켓": "11번가", "카드": df['신용카드결제'].sum(), "현금": df['현금영수증(소득공제용)'].sum() + df['현금영수증(지출증빙용)'].sum(), "기타": df['기타결제금액'].sum(), "면세": df['면세매출금액'].sum()}
-            
-        elif "롯데ON" in fname:
-            return {"마켓": "롯데온", "카드": df['신용카드'].sum(), "현금": df['현금영수증'].sum(), "기타": df['휴대폰'].sum() + df['기타'].sum(), "면세": 0}
-            
-        elif "토스" in fname:
-            card = df[df['결제수단'].str.contains('카드', na=False)]['결제수단 결제 금액'].sum()
-            cash = df[df['결제수단'].str.contains('계좌|현금', na=False)]['결제수단 결제 금액'].sum()
-            etc = df['결제수단 결제 금액'].sum() - (card + cash)
-            return {"마켓": "자사몰(토스)", "카드": card, "현금": cash, "기타": etc, "면세": 0}
-
-        elif "매출전자세금계산서" in fname:
-            return {"마켓": "세금계산서발행", "카드": 0, "현금": 0, "기타": 0, "면세": 0, "증빙": df['합계금액'].sum()}
-
-        elif "매출전자계산서" in fname:
-            return {"마켓": "면세계산서발행", "카드": 0, "현금": 0, "기타": 0, "면세": df['합계금액'].sum(), "증빙": 0}
-
+        if data_res.status_code == 200:
+            items = data_res.json()
+            if not items: return "데이터 없음 (해당 기간 매출 0건)"
+            # 합산 로직
+            sums = {"카드": 0, "현금": 0, "기타": 0, "면세": 0}
+            for i in items:
+                sums["카드"] += i.get('cardSalesAmount', 0)
+                sums["현금"] += i.get('cashReceiptSalesAmount', 0)
+                sums["기타"] += i.get('etcSalesAmount', 0)
+                sums["면세"] += i.get('taxFreeSalesAmount', 0)
+            return sums
+        return f"데이터 호출 실패: {data_res.status_code}"
     except Exception as e:
-        st.error(f"{fname} 분석 중 오류: {e}")
-    return None
+        return f"오류 발생: {e}"
 
-# --- [메인 레이아웃] ---
-col_file, col_report = st.columns([1, 1.2])
+# --- [메인 실행부] ---
+c_left, c_right = st.columns([1, 1.2])
 
-with col_file:
-    st.subheader("📁 엑셀 파일 업로드")
-    uploaded_files = st.file_uploader("쿠팡, 11번가 등 파일을 모두 선택하세요", accept_multiple_files=True)
+with c_left:
+    st.subheader("📂 엑셀 파일 업로드")
+    files = st.file_uploader("다운로드한 엑셀/CSV 파일들을 모두 선택하세요", accept_multiple_files=True)
 
-with col_report:
+with c_right:
     if st.button("🚀 부가세 통합 정산 시작"):
-        all_results = []
+        final_list = []
         
-        # 1. 네이버 API 호출
+        # 1. 네이버 처리
         if n_id and n_secret:
-            with st.spinner("네이버 데이터를 실시간으로 가져오는 중..."):
-                naver_res = get_naver_api_data(n_id, n_secret, start_date, end_date)
-                if naver_res:
-                    all_results.append({"마켓": "스마트스토어(API)", **naver_res})
+            with st.spinner("네이버 API 통신 중..."):
+                n_data = fetch_naver_data(n_id, n_secret, start_dt, end_dt)
+                if isinstance(n_data, dict):
+                    final_list.append({"마켓": "스마트스토어(API)", **n_data})
                 else:
-                    st.error("네이버 API 연결 실패! 정보를 확인하세요.")
+                    st.warning(f"네이버 API 건너뜀: {n_data}")
         
-        # 2. 엑셀 파일 분석
-        if uploaded_files:
-            for f in uploaded_files:
-                res = parse_excel_file(f)
-                if res: all_results.append(res)
+        # 2. 파일 처리
+        if files:
+            with st.spinner("파일 분석 중..."):
+                file_results = analyze_files(files)
+                final_list.extend(file_results)
         
-        if all_results:
-            df_final = pd.DataFrame(all_results).fillna(0)
-            st.subheader("📊 마켓별 매출 요약")
-            st.table(df_final)
+        if final_list:
+            df = pd.DataFrame(final_list).fillna(0)
+            st.subheader("📊 마켓별 상세 요약")
+            st.table(df)
             
             st.divider()
             st.subheader("🧾 세무사 제출용 최종 합계")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("신용카드", f"{int(df_final['카드'].sum()):,}원")
-            c2.metric("현금영수증", f"{int(df_final['현금'].sum()):,}원")
-            c3.metric("기타 매출", f"{int(df_final['기타'].sum()):,}원")
-            c4.metric("면세 합계", f"{int(df_final['면세'].sum()):,}원")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("신용카드 매출", f"{int(df['카드'].sum()):,}원")
+            k2.metric("현금영수증 매출", f"{int(df['현금'].sum()):,}원")
+            k3.metric("기타(포인트 등)", f"{int(df['기타'].sum()):,}원")
+            k4.metric("면세 매출 합계", f"{int(df['면세'].sum()):,}원")
             
-            if '증빙' in df_final.columns:
-                st.info(f"💡 세금계산서 발행액(별도): {int(df_final['증빙'].sum()):,}원")
+            if '증빙' in df.columns:
+                st.info(f"💡 전자(세금)계산서 별도 발행액 합계: {int(df['증빙'].sum()):,}원")
         else:
-            st.warning("분석할 데이터가 없습니다.")
+            st.error("분석할 데이터가 없습니다. API 정보를 입력하거나 파일을 업로드해 주세요.")
