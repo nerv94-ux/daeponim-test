@@ -1,140 +1,140 @@
 import streamlit as st
-import requests
-import time
-import bcrypt
-import base64
 import pandas as pd
+import io
 from datetime import datetime
 import calendar
 
 # 페이지 설정
-st.set_page_config(page_title="부가세 마스터 V12", layout="wide")
-st.title("🚜 유기농부 부가세 통합 정산 시스템 (V12 - 면세 정밀 집계)")
+st.set_page_config(page_title="부가세 마스터 V16", layout="wide")
+st.title("🚜 유기농부 부가세 통합 정산 시스템 (V16 - 엑셀 내보내기 포함)")
 
-# --- [사이드바 설정] ---
-with st.sidebar:
-    st.header("📅 정산 기간 선택")
-    target_year = st.selectbox("정산 연도", [2025, 2026], index=0)
-    col_s, col_e = st.columns(2)
-    with col_s: start_m = st.selectbox("시작 월", list(range(1, 13)), index=6)
-    with col_e: end_m = st.selectbox("종료 월", list(range(1, 13)), index=8)
-    
-    st.divider()
-    st.subheader("🔑 스마트스토어 API")
-    n_id = st.text_input("Client ID", key="n_id_v12")
-    n_secret = st.text_input("Client Secret", type="password", key="n_secret_v12")
-    st.caption("허용 IP: 34.127.0.121")
-
-# --- [유틸리티: 쉼표 섞인 문자열을 숫자로 변환] ---
-def clean_num(val):
+# --- [유틸리티 함수] ---
+def to_num(val):
     if pd.isna(val): return 0
-    if isinstance(val, str):
-        val = val.replace(',', '').strip()
+    if isinstance(val, (int, float)): return val
+    clean = str(val).replace(',', '').replace('원', '').replace(' ', '').strip()
+    try: return float(clean)
+    except: return 0
+
+# --- [마켓별 개별 분석 엔진] ---
+def analyze_market_file(file):
+    fname = file.name
     try:
-        return float(val)
-    except:
-        return 0
+        # 1. 스마트스토어 상세 내역
+        if "스마트스토어" in fname and "상세내역" in fname:
+            df = pd.read_csv(file)
+            for c in ['과세매출','면세매출','신용카드매출전표','현금(소득공제)','현금(지출증빙)','기타']:
+                df[c] = df[c].apply(to_num)
+            t_df, f_df = df[df['과세매출']>0], df[df['면세매출']>0]
+            return {
+                "과세_신용": t_df['신용카드매출전표'].sum(),
+                "과세_현금": t_df['현금(소득공제)'].sum() + t_df['현금(지출증빙)'].sum(),
+                "과세_기타": t_df['기타'].sum(),
+                "면세_신용": f_df['신용카드매출전표'].sum(),
+                "면세_현금": f_df['현금(소득공제)'].sum() + f_df['현금(지출증빙)'].sum(),
+                "면세_기타": f_df['기타'].sum()
+            }
 
-# --- [네이버 API: 면세 통합 처리 로직] ---
-def fetch_naver_vat_v12(cid, secret, start_m, end_m, year):
-    try:
-        ts = str(int(time.time() * 1000))
-        pwd = (cid + "_" + ts).encode('utf-8')
-        sign = base64.b64encode(bcrypt.hashpw(pwd, secret.encode('utf-8'))).decode('utf-8')
+        # 2. 쿠팡 결제수단별 매출내역
+        elif "쿠팡" in fname:
+            df = pd.read_csv(file)
+            for c in ['신용카드(판매)','현금(판매)','기타(판매)','신용카드(환불)','현금(환불)','기타(환불)']:
+                df[c] = df[c].apply(to_num)
+            df['신용'] = df['신용카드(판매)'] - df['신용카드(환불)']
+            df['현금'] = df['현금(판매)'] - df['현금(환불)']
+            df['기타'] = df['기타(판매)'] - df['기타(환불)']
+            t_df, f_df = df[df['과세유형']=='TAX'], df[df['과세유형']=='FREE']
+            return {
+                "과세_신용": t_df['신용'].sum(), "과세_현금": t_df['현금'].sum(), "과세_기타": t_df['기타'].sum(),
+                "면세_신용": f_df['신용'].sum(), "면세_현금": f_df['현금'].sum(), "면세_기타": f_df['기타'].sum()
+            }
 
-        token_res = requests.post("https://api.commerce.naver.com/external/v1/oauth2/token", 
-                                  data={"client_id": cid, "timestamp": ts, "grant_type": "client_credentials", "client_secret_sign": sign, "type": "SELF"})
-        token = token_res.json().get('access_token')
-        if not token: return None
+        # 3. 토스 건별 정산
+        elif "토스" in fname:
+            df = pd.read_csv(file)
+            df['금액'] = df['결제수단 결제 금액'].apply(to_num)
+            def classify(name):
+                if any(x in str(name) for x in ['커피', '오르조']): return 'TAX'
+                if any(x in str(name) for x in ['양배추', '당근']): return 'FREE'
+                return 'TAX'
+            df['유형'] = df['상품명'].apply(classify)
+            t_df, f_df = df[df['유형']=='TAX'], df[df['유형']=='FREE']
+            def get_sum(sub):
+                card = sub[sub['결제수단'].str.contains('카드', na=False)]['금액'].sum()
+                cash = sub[sub['결제수단'].str.contains('계좌|가상', na=False)]['금액'].sum()
+                return card, cash, sub['금액'].sum() - (card+cash)
+            tc, th, tg = get_sum(t_df)
+            fc, fh, fg = get_sum(f_df)
+            return {"과세_신용": tc, "과세_현금": th, "과세_기타": tg, "면세_신용": fc, "면세_현금": fh, "면세_기타": fg}
 
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        total = {
-            "과세_신용카드": 0, "과세_현금영수증": 0, "과세_기타": 0,
-            "면세_신용카드": 0, "면세_현금영수증": 0, "면세_기타": 0, "면세_합계": 0
-        }
-        
-        for month in range(start_m, end_m + 1):
-            last_day = calendar.monthrange(year, month)[1]
-            params = {"startDate": f"{year}-{month:02d}-01", "endDate": f"{year}-{month:02d}-{last_day:02d}", "pageNumber": 1, "pageSize": 1000}
-            url = "https://api.commerce.naver.com/external/v1/pay-settle/vat/daily"
-            res = requests.get(url, headers=headers, params=params)
-            
-            if res.status_code == 200:
-                items = res.json().get('elements', [])
-                for i in items:
-                    # 과세는 상세 분류
-                    total["과세_신용카드"] += i.get('creditCardAmount', 0)
-                    total["과세_현금영수증"] += i.get('cashInComeDeductionAmount', 0) + i.get('cashOutGoingEvidenceAmount', 0)
-                    total["과세_기타"] += i.get('otherAmount', 0)
-                    # 면세는 API 특성상 합계로 들어오는 경우가 많음
-                    total["면세_합계"] += i.get('taxExemptionSalesAmount', 0)
-        return total
-    except: return None
+        # 4. 11번가 일자별 매출
+        elif "11번가" in fname:
+            df = pd.read_csv(file, skiprows=5)
+            for c in ['신용카드결제','현금영수증(소득공제용)','현금영수증(지출증빙용)','기타결제금액']:
+                df[c] = df[c].apply(to_num)
+            # 11번가는 가공품 위주로 우선 분류
+            return {
+                "과세_신용": df['신용카드결제'].sum(), 
+                "과세_현금": df['현금영수증(소득공제용)'].sum() + df['현금영수증(지출증빙용)'].sum(),
+                "과세_기타": df['기타결제금액'].sum(),
+                "면세_신용": 0, "면세_현금": 0, "면세_기타": 0
+            }
 
-# --- [엑셀 분석: 쉼표 제거 및 6종 분류] ---
-def parse_excel_v12(file):
-    try:
-        df = pd.read_csv(file, header=None, encoding='utf-8-sig') if file.name.endswith('.csv') else pd.read_excel(file, header=None)
-        df = df.iloc[3:] # 데이터 시작점
-        
-        # 각 칸의 데이터를 숫자로 깨끗하게 변환
-        res = {
-            "과세_신용카드": df.iloc[:,2].apply(clean_num).sum(),
-            "과세_현금영수증": df.iloc[:,3].apply(clean_num).sum(),
-            "과세_기타": df.iloc[:,4].apply(clean_num).sum(),
-            "면세_신용카드": df.iloc[:,5].apply(clean_num).sum(),
-            "면세_현금영수증": df.iloc[:,6].apply(clean_num).sum(),
-            "면세_기타": df.iloc[:,7].apply(clean_num).sum(),
-        }
-        return res
-    except: return None
+    except Exception as e:
+        st.error(f"⚠️ {fname} 분석 중 오류: {e}")
+    return None
 
-# --- [메인 실행부] ---
-col_in, col_out = st.columns([1, 1.5])
+# --- [메인 레이아웃] ---
+with st.sidebar:
+    st.header("📅 정산 기간")
+    target_year = st.selectbox("연도", [2025, 2026], index=0)
+    start_m = st.selectbox("시작 월", list(range(1, 13)), index=6) # 7월
+    end_m = st.selectbox("종료 월", list(range(1, 13)), index=8)   # 9월
 
-with col_in:
-    st.subheader("📂 데이터 업로드")
-    files = st.file_uploader("정산 엑셀(CSV) 파일을 올려주세요", accept_multiple_files=True)
+uploaded_files = st.file_uploader("📂 정산 파일들을 한꺼번에 올려주세요 (20개 이상 가능)", accept_multiple_files=True)
 
-with col_out:
-    if st.button("🚀 세무사 제출용 통합 정산 시작"):
-        final_data = {
+if st.button("🚀 전체 통합 정산 및 엑셀 생성"):
+    if uploaded_files:
+        final_summary = {
             "과세": {"신용카드": 0, "현금영수증": 0, "기타": 0},
             "면세": {"신용카드": 0, "현금영수증": 0, "기타": 0}
         }
         
-        # 1. 네이버 API 데이터 합산
-        if n_id and n_secret:
-            n_res = fetch_naver_vat_v12(n_id, n_secret, start_m, end_m, target_year)
-            if isinstance(n_res, dict):
-                final_data["과세"]["신용카드"] += n_res["과세_신용카드"]
-                final_data["과세"]["현금영수증"] += n_res["과세_현금영수증"]
-                final_data["과세"]["기타"] += n_res["과세_기타"]
-                # API가 면세 상세를 안 주면 '기타'에 몰아서 합산 (데이터 유실 방지)
-                if n_res["면세_합계"] > 0 and (n_res["면세_신용카드"] + n_res["면세_현금영수증"]) == 0:
-                    final_data["면세"]["기타"] += n_res["면세_합계"]
-                else:
-                    final_data["면세"]["신용카드"] += n_res["면세_신용카드"]
-                    final_data["면세"]["현금영수증"] += n_res["면세_현금영수증"]
-                    final_data["면세"]["기타"] += n_res["면세_기타"]
-        
-        # 2. 엑셀 데이터 합산
-        if files:
-            for f in files:
-                f_res = parse_excel_v12(f)
-                if f_res:
-                    final_data["과세"]["신용카드"] += f_res["과세_신용카드"]
-                    final_data["과세"]["현금영수증"] += f_res["과세_현금영수증"]
-                    final_data["과세"]["기타"] += f_res["과세_기타"]
-                    final_data["면세"]["신용카드"] += f_res["면세_신용카드"]
-                    final_data["면세"]["현금영수증"] += f_res["면세_현금영수증"]
-                    final_data["면세"]["기타"] += f_res["면세_기타"]
+        for f in uploaded_files:
+            res = analyze_market_file(f)
+            if res:
+                final_summary["과세"]["신용카드"] += res["과세_신용"]
+                final_summary["과세"]["현금영수증"] += res["과세_현금"]
+                final_summary["과세"]["기타"] += res["과세_기타"]
+                final_summary["면세"]["신용카드"] += res["면세_신용"]
+                final_summary["면세"]["현금영수증"] += res["면세_현금"]
+                final_summary["면세"]["기타"] += res["면세_기타"]
 
-        # --- [결과 표시] ---
-        st.subheader(f"📊 {start_m}월~{end_m}월 통합 매출 현황")
+        # 1. 화면 출력용 표 생성
+        df_report = pd.DataFrame(final_summary).T
+        df_report['합계'] = df_report.sum(axis=1)
+        st.subheader(f"📊 {start_m}~{end_m}월 통합 부가세 정산 결과")
+        st.table(df_report.applymap(lambda x: f"{int(x):,}원"))
+
+        # 2. 엑셀 파일 생성 (내보내기 기능)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df_report.to_excel(writer, sheet_name='부가세정산_최종')
         
-        report_df = pd.DataFrame(final_data).T
-        report_df['합계'] = report_df.sum(axis=1)
-        st.table(report_df.applymap(lambda x: f"{int(x):,}원"))
+        st.download_button(
+            label="📥 세무사 제출용 통합 엑셀 다운로드",
+            data=output.getvalue(),
+            file_name=f"유기농부_부가세정산_{start_m}_{end_m}월.xlsx",
+            mime="application/vnd.ms-excel"
+        )
         
-        st.info("💡 네이버 API는 면세 매출의 카드/현금 상세 분류를 제공하지 않아 면세 합계액을 '기타' 항목에 합산하였습니다. 정확한 분류를 원하시면 스마트스토어에서 내려받은 엑셀 파일을 함께 업로드해 주세요.")
+        # 3. 텍스트 요약 (복사용)
+        st.info("💡 아래 텍스트를 복사해서 세무사님께 카톡으로 먼저 보내실 수도 있습니다.")
+        st.code(f"""
+[유기농부 {start_m}~{end_m}월 정산 요약]
+- 과세 총합: {int(df_report.loc['과세', '합계']):,}원
+- 면세 총합: {int(df_report.loc['면세', '합계']):,}원
+- 전체 합계: {int(df_report['합계'].sum()):,}원
+        """)
+    else:
+        st.warning("먼저 파일을 업로드해 주세요.")
