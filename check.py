@@ -1,136 +1,187 @@
 import streamlit as st
 import pandas as pd
 import io
+import re
 
-st.set_page_config(page_title="부가세 마스터 V18", layout="wide")
-st.title("🚜 유기농부 부가세 통합 정산 시스템 (V18 - 전 마켓 통합본)")
+# 페이지 설정
+st.set_page_config(page_title="부가세 마스터 V20", layout="wide")
+st.title("🚜 유기농부 부가세 통합 정산 시스템 (V20 - 최종형)")
 
-# --- [유틸리티 함수] ---
-def smart_read_csv(file):
+# --- [1. 유틸리티 함수: 지능형 숫자 변환 및 인코딩] ---
+def smart_read(file):
+    """여러 인코딩을 시도하여 파일을 읽어옵니다."""
     for enc in ['cp949', 'utf-8-sig', 'utf-8', 'euc-kr']:
         try:
             file.seek(0)
-            return pd.read_csv(file, encoding=enc)
+            # 11번가나 일부 엑셀 변환 CSV는 상단에 쓰레기 데이터가 있을 수 있어 체크
+            df = pd.read_csv(file, encoding=enc)
+            if df.shape[1] < 2: continue # 제대로 안 읽혔으면 다음 인코딩
+            return df
         except: continue
     return None
 
-def to_num(val):
+def to_n(val):
+    """문자열 숫자를 깨끗한 실수로 변환"""
     if pd.isna(val): return 0
-    clean = str(val).replace(',', '').replace('원', '').replace(' ', '').strip()
-    try: return float(clean)
+    if isinstance(val, (int, float)): return float(val)
+    # 쉼표, 원, 공백 제거
+    clean = re.sub(r'[^\d.]', '', str(val))
+    try: return float(clean) if clean else 0
     except: return 0
 
-# --- [마켓별 정밀 분석 엔진] ---
-def analyze_file_v18(file):
+def find_col(df, keyword):
+    """컬럼명 중 키워드가 포함된 첫 번째 컬럼을 반환"""
+    for col in df.columns:
+        if keyword in str(col).replace(" ", ""):
+            return col
+    return None
+
+# --- [2. 마켓별 지능형 분석 엔진] ---
+def analyze_market_intelligence(file):
     fname = file.name
+    df = smart_read(file)
+    if df is None: return "파일 해독 불가"
+
     try:
-        df = smart_read_csv(file)
-        if df is None: return "파일 읽기 실패"
-        
-        # 1. 스마트스토어
-        if "스마트스토어" in fname:
-            cols = ['과세매출','면세매출','신용카드매출전표','현금(소득공제)','현금(지출증빙)','기타']
-            for c in cols: 
-                if c in df.columns: df[c] = df[c].apply(to_num)
-            t_df = df[df['과세매출'] > 0]
-            f_df = df[df['면세매출'] > 0]
+        # A. 스마트스토어 상세내역
+        if "스마트스토어" in fname or find_col(df, "과세매출"):
+            c_tax = find_col(df, "과세매출")
+            c_free = find_col(df, "면세매출")
+            c_card = find_col(df, "신용카드")
+            c_cash_s = find_col(df, "현금(소득")
+            c_cash_j = find_col(df, "현금(지출")
+            c_etc = find_col(df, "기타")
+            
+            # 행별 분류 로직
+            df['is_tax'] = df[c_tax].apply(to_n) > 0
+            df['is_free'] = df[c_free].apply(to_n) > 0
+            
+            res = {"과세_신용": 0, "과세_현금": 0, "과세_기타": 0, "면세_신용": 0, "면세_현금": 0, "면세_기타": 0}
+            
+            # 과세 합산
+            tax_df = df[df['is_tax']]
+            res["과세_신용"] = tax_df[c_card].apply(to_n).sum()
+            res["과세_현금"] = tax_df[c_cash_s].apply(to_n).sum() + tax_df[c_cash_j].apply(to_n).sum()
+            res["과세_기타"] = tax_df[c_etc].apply(to_n).sum()
+            
+            # 면세 합산
+            free_df = df[df['is_free']]
+            res["면세_신용"] = free_df[c_card].apply(to_n).sum()
+            res["면세_현금"] = free_df[c_cash_s].apply(to_n).sum() + free_df[c_cash_j].apply(to_n).sum()
+            res["면세_기타"] = free_df[c_etc].apply(to_n).sum()
+            return res
+
+        # B. 쿠팡 (과세유형 TAX/FREE 기반)
+        elif "쿠팡" in fname or find_col(df, "과세유형"):
+            c_type = find_col(df, "과세유형")
+            c_card_p = find_col(df, "신용카드(판매)")
+            c_card_r = find_col(df, "신용카드(환불)")
+            c_cash_p = find_col(df, "현금(판매)")
+            c_cash_r = find_col(df, "현금(환불)")
+            c_etc_p = find_col(df, "기타(판매)")
+            c_etc_r = find_col(df, "기타(환불)")
+
+            df['net_card'] = df[c_card_p].apply(to_n) - df[c_card_r].apply(to_n)
+            df['net_cash'] = df[c_cash_p].apply(to_n) - df[c_cash_r].apply(to_n)
+            df['net_etc'] = df[c_etc_p].apply(to_n) - df[c_etc_r].apply(to_n)
+
+            t_df = df[df[c_type].str.contains("TAX", na=False)]
+            f_df = df[df[c_type].str.contains("FREE", na=False)]
+
             return {
-                "과세_신용": t_df['신용카드매출전표'].sum(),
-                "과세_현금": t_df['현금(소득공제)'].sum() + t_df['현금(지출증빙)'].sum(),
-                "과세_기타": t_df['기타'].sum(),
-                "면세_신용": f_df['신용카드매출전표'].sum(),
-                "면세_현금": f_df['현금(소득공제)'].sum() + f_df['현금(지출증빙)'].sum(),
-                "면세_기타": f_df['기타'].sum()
-            }
-        
-        # 2. 쿠팡
-        elif "쿠팡" in fname:
-            cols = ['신용카드(판매)','현금(판매)','기타(판매)','신용카드(환불)','현금(환불)','기타(환불)']
-            for c in cols:
-                if c in df.columns: df[c] = df[c].apply(to_num)
-            df['신용'] = df['신용카드(판매)'] - df.get('신용카드(환불)', 0)
-            df['현금'] = df['현금(판매)'] - df.get('현금(환불)', 0)
-            df['기타'] = df['기타(판매)'] - df.get('기타(환불)', 0)
-            t_df = df[df['과세유형'] == 'TAX']
-            f_df = df[df['과세유형'] == 'FREE']
-            return {
-                "과세_신용": t_df['신용'].sum(), "과세_현금": t_df['현금'].sum(), "과세_기타": t_df['기타'].sum(),
-                "면세_신용": f_df['신용'].sum(), "면세_현금": f_df['현금'].sum(), "면세_기타": f_df['기타'].sum()
+                "과세_신용": t_df['net_card'].sum(), "과세_현금": t_df['net_cash'].sum(), "과세_기타": t_df['net_etc'].sum(),
+                "면세_신용": f_df['net_card'].sum(), "면세_현금": f_df['net_cash'].sum(), "면세_기타": f_df['net_etc'].sum()
             }
 
-        # 3. 토스
+        # C. 토스 (상품명 키워드 분류)
         elif "토스" in fname:
-            df['금액'] = df['결제수단 결제 금액'].apply(to_num)
-            def classify(name):
-                name_str = str(name)
-                if any(x in name_str for x in ['커피', '오르조']): return 'TAX'
-                if any(x in name_str for x in ['양배추', '당근', '감자']): return 'FREE'
+            c_name = find_col(df, "상품명")
+            c_pay = find_col(df, "결제수단")
+            c_amt = find_col(df, "결제수단결제금액")
+            
+            def toss_tax(name):
+                n = str(name)
+                if any(x in n for x in ['양배추','당근','감자','브로콜리','농산물']): return 'FREE'
                 return 'TAX'
-            df['유형'] = df['상품명'].apply(classify)
-            t_df, f_df = df[df['유형']=='TAX'], df[df['유형']=='FREE']
-            def get_sum(sub):
-                card = sub[sub['결제수단'].str.contains('카드', na=False)]['금액'].sum()
-                cash = sub[sub['결제수단'].str.contains('계좌|가상', na=False)]['금액'].sum()
-                return card, cash, sub['금액'].sum() - (card + cash)
-            tc, th, tg = get_sum(t_df); fc, fh, fg = get_sum(f_df)
-            return {"과세_신용": tc, "과세_현금": th, "과세_기타": tg, "면세_신용": fc, "면세_현금": fh, "면세_기타": fg}
+            
+            df['type'] = df[c_name].apply(toss_tax)
+            res = {"과세_신용": 0, "과세_현금": 0, "과세_기타": 0, "면세_신용": 0, "면세_현금": 0, "면세_기타": 0}
+            
+            for _, row in df.iterrows():
+                amt = to_n(row[c_amt])
+                p_method = str(row[c_pay])
+                prefix = "과세" if row['type'] == 'TAX' else "면세"
+                
+                if "카드" in p_method: res[f"{prefix}_신용"] += amt
+                elif any(x in p_method for x in ["계좌", "가상", "현금"]): res[f"{prefix}_현금"] += amt
+                else: res[f"{prefix}_기타"] += amt
+            return res
 
-        # 4. 롯데ON & 11번가 (요약형)
-        elif "롯데ON" in fname or "롯데온" in fname:
-            for c in ['신용카드', '현금영수증', '기타', '휴대폰']:
-                if c in df.columns: df[c] = df[c].apply(to_num)
-            return {"과세_신용": df['신용카드'].sum(), "과세_현금": df['현금영수증'].sum(), "과세_기타": df['기타'].sum() + df.get('휴대폰', pd.Series([0])).sum(), "면세_신용": 0, "면세_현금": 0, "면세_기타": 0}
-        
+        # D. 11번가 (5행 스킵 로직 포함)
         elif "11번가" in fname:
-            df = smart_read_csv(file) # 다시 읽기 (skiprows 적용 위해)
-            # 11번가는 보통 6행부터 데이터
+            # 11번가는 데이터가 6행부터 시작하는 경우가 많음
+            file.seek(0)
             df = pd.read_csv(file, skiprows=5, encoding='cp949')
-            for c in ['신용카드결제', '현금영수증(소득공제용)', '현금영수증(지출증빙용)', '기타결제금액']:
-                if c in df.columns: df[c] = df[c].apply(to_num)
-            return {"과세_신용": df['신용카드결제'].sum(), "과세_현금": df['현금영수증(소득공제용)'].sum() + df['현금영수증(지출증빙용)'].sum(), "과세_기타": df['기타결제금액'].sum(), "면세_신용": 0, "면세_현금": 0, "면세_기타": 0}
+            c_card = find_col(df, "신용카드결제")
+            c_cash = find_col(df, "현금영수증")
+            c_etc = find_col(df, "기타결제")
+            return {
+                "과세_신용": df[c_card].apply(to_n).sum(),
+                "과세_현금": df[c_cash].apply(to_n).sum() if c_cash else 0,
+                "과세_기타": df[c_etc].apply(to_n).sum() if c_etc else 0,
+                "면세_신용": 0, "면세_현금": 0, "면세_기타": 0
+            }
 
     except Exception as e:
-        return f"분석 에러: {str(e)}"
-    return "미지원 파일명"
+        return f"분석 중 오류 발생: {str(e)}"
+    return "지원하지 않는 파일 형식"
 
-# --- [메인 실행 화면] ---
-uploaded_files = st.file_uploader("📂 정산 파일들을 올려주세요 (20개 이상 가능)", accept_multiple_files=True)
+# --- [3. 메인 UI] ---
+with st.sidebar:
+    st.header("⚙️ 설정")
+    period = st.text_input("리포트 제목", "2025년 3분기 부가세 정산")
 
-if uploaded_files:
-    if st.button("🚀 부가세 통합 정산 및 분석 리포트 생성"):
-        final_summary = {"과세": {"신용카드": 0, "현금영수증": 0, "기타": 0}, "면세": {"신용카드": 0, "현금영수증": 0, "기타": 0}}
-        analysis_log = []
-        
-        for f in uploaded_files:
-            res = analyze_file_v18(f)
+files = st.file_uploader("📂 정산 파일들을 모두 선택하세요 (20개 이상 무제한)", accept_multiple_files=True)
+
+if files:
+    st.subheader("📋 업로드 파일 분석 현황")
+    logs = []
+    final_summary = {"과세": {"신용카드": 0, "현금영수증": 0, "기타": 0}, "면세": {"신용카드": 0, "현금영수증": 0, "기타": 0}}
+
+    if st.button("🚀 정산 시작 (분류기 가동)"):
+        for f in files:
+            res = analyze_market_intelligence(f)
             if isinstance(res, dict):
-                row_total = sum(res.values())
-                analysis_log.append({"파일명": f.name, "인식결과": "성공", "추출금액": f"{int(row_total):,}원"})
-                # 합산 로직
-                final_summary["과세"]["신용카드"] += res["과세_신용"]
-                final_summary["과세"]["현금영수증"] += res["과세_현금"]
-                final_summary["과세"]["기타"] += res["과세_기타"]
-                final_summary["면세"]["신용카드"] += res["면세_신용"]
-                final_summary["면세"]["현금영수증"] += res["면세_현금"]
-                final_summary["면세"]["기타"] += res["면세_기타"]
+                logs.append({"파일명": f.name, "상태": "✅ 성공", "금액": f"{int(sum(res.values())):,}원"})
+                # 마스터 합산
+                for k, v in res.items():
+                    cat, typ = k.split('_')
+                    t_map = {"신용": "신용카드", "현금": "현금영수증", "기타": "기타"}
+                    final_summary[cat][t_map[typ]] += v
             else:
-                analysis_log.append({"파일명": f.name, "인식결과": f"실패 ({res})", "추출금액": "0원"})
+                logs.append({"파일명": f.name, "상태": f"❌ {res}", "금액": "0원"})
         
-        # 1. 분석 현황판 (디버깅용)
-        st.subheader("📋 파일별 분석 상세 리포트")
-        st.table(pd.DataFrame(analysis_log))
+        st.table(pd.DataFrame(logs))
         
-        # 2. 최종 결과 표
-        df_report = pd.DataFrame(final_summary).T
-        df_report['합계'] = df_report.sum(axis=1)
-        st.subheader("📊 3분기 최종 통합 정산 결과")
-        st.table(df_report.applymap(lambda x: f"{int(x):,}원"))
+        # 결과 표
+        st.divider()
+        st.subheader(f"📊 {period} 통합 결과")
+        df_res = pd.DataFrame(final_summary).T
+        df_res['합계'] = df_res.sum(axis=1)
+        st.table(df_res.applymap(lambda x: f"{int(x):,}원"))
 
-        # 3. 엑셀 다운로드 (xlsxwriter 설치 확인 필수)
+        # 엑셀 내보내기
         try:
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df_report.to_excel(writer, sheet_name='최종보고서')
-            st.download_button("📥 세무사 제출용 엑셀 다운로드", output.getvalue(), "부가세_통합정산_최종.xlsx")
+                df_res.to_excel(writer, sheet_name='부가세정산')
+            st.download_button("📥 세무사 제출용 엑셀 다운로드", output.getvalue(), f"{period}.xlsx")
         except:
-            st.warning("⚠️ 엑셀 엔진(xlsxwriter)이 설치되지 않아 다운로드가 불가능합니다. requirements.txt를 확인해 주세요.")
+            st.info("💡 엑셀 엔진이 설치되지 않았습니다. 수치를 복사해서 사용하세요.")
+            
+        st.code(f"""
+[세무사 제출용 요약]
+과세 합계: {int(df_res.loc['과세', '합계']):,}원
+면세 합계: {int(df_res.loc['면세', '합계']):,}원
+총 매출: {int(df_res['합계'].sum()):,}원
+        """)
