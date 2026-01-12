@@ -1,37 +1,73 @@
 import streamlit as st
-import pandas as pd
+import requests
+import time
+import hmac
+import hashlib
+import bcrypt
+import base64
+from datetime import datetime
 
-# 프로그램 제목
-st.title("🚀 대표님의 첫 번째 파이썬 프로그램")
-st.subheader("초간단 부가세 계산기")
+st.set_page_config(page_title="API 연결 테스트", layout="centered")
+st.title("🛡️ API 연결 상태 긴급 점검")
 
-st.markdown("---")
+# 탭으로 네이버/쿠팡 분리
+tab1, tab2 = st.tabs(["네이버 스마트스토어", "쿠팡 (Coupang)"])
 
-# 1. 숫자 입력 받기
-amount = st.number_input("전체 판매 금액(합계)을 입력해보세요", min_value=0, value=110000, step=1000)
+# --- [네이버 테스트 로직] ---
+with tab1:
+    st.subheader("네이버 커머스 API 테스트")
+    n_client_id = st.text_input("애플리케이션 ID (Client ID)")
+    n_client_secret = st.text_input("애플리케이션 시크릿 (Client Secret)", type="password")
 
-# 2. 부가세 계산 로직 (10% 기준)
-# 공급가액 = 합계 / 1.1
-# 부가세 = 합계 - 공급가액
-supply_value = int(amount / 1.1)
-vat = amount - supply_value
+    if st.button("네이버 연결 시도"):
+        timestamp = str(int(time.time() * 1000))
+        # 네이버 특유의 보안 방식 (bcrypt 해싱)
+        password = (n_client_id + "_" + timestamp).encode('utf-8')
+        hashed = bcrypt.hashpw(password, n_client_secret.encode('utf-8'))
+        client_secret_sign = base64.b64encode(hashed).decode('utf-8')
 
-# 3. 결과 화면에 보여주기
-st.write(f"입력하신 금액 **{amount:,}원**에 대한 계산 결과입니다.")
+        url = "https://api.commerce.naver.com/external/v1/oauth2/token"
+        data = {
+            "client_id": n_client_id,
+            "timestamp": timestamp,
+            "grant_type": "client_credentials",
+            "client_secret_sign": client_secret_sign,
+            "type": "SELF"
+        }
+        
+        res = requests.post(url, data=data)
+        if res.status_code == 200:
+            st.success("✅ 네이버 연결 성공! (토글과 상관없이 단독 작동 가능)")
+        else:
+            st.error(f"❌ 실패: {res.json().get('message', '정보를 확인하세요')}")
 
-col1, col2 = st.columns(2)
-col1.metric("공급가액", f"{supply_value:,}원")
-col2.metric("부가세(10%)", f"{vat:,}원")
+# --- [쿠팡 테스트 로직] ---
+with tab2:
+    st.subheader("쿠팡 마켓플레이스 API 테스트")
+    c_vendor_id = st.text_input("업체코드 (Vendor ID - 예: A00123456)")
+    c_access_key = st.text_input("Access Key")
+    c_secret_key = st.text_input("Secret Key", type="password")
 
-st.markdown("---")
-
-# 4. 간단한 표 만들기
-st.write("📋 엑셀 형태 미리보기")
-data = {
-    "구분": ["공급가액", "부가세", "합계"],
-    "금액": [f"{supply_value:,}원", f"{vat:,}원", f"{amount:,}원"]
-}
-df = pd.DataFrame(data)
-st.table(df)
-
-st.success("위 화면이 잘 보이신다면, 이제 API를 연결할 준비가 모두 끝난 것입니다!")
+    if st.button("쿠팡 연결 시도"):
+        # 쿠팡 API 호출을 위한 서명(Signature) 생성
+        import os
+        os.environ['TZ'] = 'GMT'
+        dt = datetime.utcnow().strftime('%y%m%d' + 'T' + '%H%M%S' + 'Z')
+        path = "/v2/providers/seller_api/apis/api/v1/marketplace/seller-products"
+        message = dt + "GET" + path
+        
+        signature = hmac.new(c_secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).hexdigest()
+        authorization = f"CEA algorithm=HmacSHA256, access-key={c_access_key}, signed-date={dt}, signature={signature}"
+        
+        url = f"https://api-gateway.coupang.com{path}"
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "Authorization": authorization,
+            "X-Requested-By": c_vendor_id
+        }
+        
+        res = requests.get(url, headers=headers, params={"maxPerPage": 1})
+        if res.status_code == 200:
+            st.success("✅ 쿠팡 연결 성공! (자체개발/IP 등록이 올바르게 되었습니다)")
+        else:
+            st.error(f"❌ 실패 (코드 {res.status_code}): 토글 IP와 대표님 IP가 모두 등록되었는지 확인하세요.")
